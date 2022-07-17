@@ -19,7 +19,7 @@ from distlib.version import NormalizedVersion
 _CMAKE_MINIMUM_REQUIRED = NormalizedVersion('3.15')
 
 
-class _BuildBackend(object):
+class _BuildBackend:
 
     def __init__(self) -> None:
         self.verbose = False
@@ -214,11 +214,11 @@ class _BuildBackend(object):
         except ConfigError as e:
             if not self.verbose:
                 e.args = ("\n"
-                        "\n"
-                        "\t❌ Error in configuration:\n"
-                        "\n"
-                        f"\t\t{e}\n"
-                        "\n", )
+                          "\n"
+                          "\t❌ Error in configuration:\n"
+                          "\n"
+                          f"\t\t{e}\n"
+                          "\n", )
             raise
         if self.verbose:
             print("\npy-build-cmake options")
@@ -259,7 +259,7 @@ class _BuildBackend(object):
         if not editable:
             self.copy_pkg_source_to(staging_dir, src_dir, pkg)
         else:
-            self.write_editable_wrapper(staging_dir, src_dir, pkg)
+            self.write_editable_hook(staging_dir, src_dir, pkg)
 
         # Create dist-info folder
         distinfo = staging_dir / f'{dist_name}-{metadata.version}.dist-info'
@@ -286,6 +286,10 @@ class _BuildBackend(object):
                                              src_dir, cfg, metadata, dist_name,
                                              import_name)
 
+        # Install the stubs for editable installs
+        if editable and False:
+            self.install_editable_stubs(staging_dir, pkg)
+
         # Create wheel
         whl_name = self.create_wheel(wheel_directory, staging_dir, cfg,
                                      dist_name, metadata.version)
@@ -297,9 +301,9 @@ class _BuildBackend(object):
     def do_native_cross_cmake_build(self, tmp_build_dir, staging_dir, src_dir,
                                     cfg, metadata, dist_name, import_name):
         """If not cross-compiling, just do a regular CMake build+install.
-        When cross-compiling, do a cross-build+install (using the provided 
+        When cross-compiling, do a cross-build+install (using the provided
         CMake toolchain file).
-        If cfg.cross['copy_from_native_build'] is set, before cross-compiling, 
+        If cfg.cross['copy_from_native_build'] is set, before cross-compiling,
         first a normal build+install is performed to a separate directory, then
         the cross-build+install is performed, and finally the installed files
         from the native build that match the patterns in
@@ -353,41 +357,56 @@ class _BuildBackend(object):
         elif 'file' in license:
             shutil.copy2(srcdir / license['file'], distinfo_dir)
 
-    def write_editable_wrapper(self, tmp_build_dir: Path, src_dir: Path, pkg):
-        # Write a fake __init__.py file that points to the development folder
-        tmp_pkg: Path = tmp_build_dir / pkg.name
-        pkgpath = Path(pkg.path)
-        initpath = pkgpath / '__init__.py'
-        os.makedirs(tmp_pkg, exist_ok=True)
-        special_dunders = [
-            '__builtins__', '__cached__', '__file__', '__loader__', '__name__',
-            '__package__', '__path__', '__spec__'
-        ]
+    def write_editable_hook(self, tmp_build_dir: Path, src_dir: Path, pkg):
+        # Write a hook that finds the installed compiled extension modules
+        pkg_hook: Path = tmp_build_dir / (pkg.name + '_editable_hook')
+        os.makedirs(pkg_hook, exist_ok=True)
         content = f"""\
-            # First extend the search path with the development folder
-            __spec__.submodule_search_locations.insert(0, {str(pkgpath)!a})
-            # Now manually import the development __init__.py
-            from importlib import util as _util
-            _spec = _util.spec_from_file_location("{pkg.name}",
-                                                  {str(initpath)!a})
-            _mod = _util.module_from_spec(_spec)
-            _spec.loader.exec_module(_mod)
-            # After importing, add its symbols to our global scope
-            _vars = _mod.__dict__.copy()
-            for _k in ['{"','".join(special_dunders)}']: _vars.pop(_k)
-            globals().update(_vars)
-            # Clean up
-            del _k, _spec, _mod, _vars, _util
+            import sys, inspect, os
+            from importlib.machinery import PathFinder
+
+            class EditablePathFinder(PathFinder):
+                def __init__(self, name, extra_path):
+                    self.name = name
+                    self.extra_path = extra_path
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.', 1)[0] != self.name:
+                        return None
+                    path = (path or []) + [self.extra_path]
+                    return super().find_spec(name, path, target)
+
+            def install(name: str):
+                source_path = os.path.abspath(inspect.getsourcefile(EditablePathFinder))
+                source_dir = os.path.dirname(source_path)
+                installed_path = os.path.join(source_dir, '..', name)
+                sys.meta_path.insert(0, EditablePathFinder(name, installed_path))
+
+            install('{pkg.name}')
             """
-        (tmp_pkg / '__init__.py').write_text(textwrap.dedent(content),
-                                             encoding='utf-8')
-        # Add the py.typed file if it exists, so mypy picks up the stubs for
-        # the C++ extensions
-        py_typed: Path = pkg.path / 'py.typed'
-        if py_typed.exists():
-            shutil.copy2(py_typed, tmp_pkg)
-        # Write a path file so IDEs find the correct files as well
-        (tmp_build_dir / f'{pkg.name}.pth').write_text(str(pkg.path.parent))
+        (pkg_hook / '__init__.py').write_text(textwrap.dedent(content),
+                                              encoding='utf-8')
+        # Write a path file to find the development files
+        content = f"""\
+            {str(pkg.path.parent)}
+            import {pkg.name}_editable_hook"""
+        (tmp_build_dir / f'{pkg.name}.pth').write_text(
+            textwrap.dedent(content))
+
+    def install_editable_stubs(self, tmp_build_dir: Path, pkg):
+        src_dir: Path = tmp_build_dir / pkg.name
+        if not src_dir.exists():
+            return
+
+        # Install the stubs (only .pyi files)
+        ignore_filter = lambda n: not n.endswith('.pyi')
+        ignore = lambda _, names: filter(ignore_filter, names)
+        pkg_stubs: Path = tmp_build_dir / (pkg.name + '-stubs')
+        shutil.copytree(src_dir,
+                        pkg_stubs,
+                        symlinks=True,
+                        ignore=ignore,
+                        ignore_dangling_symlinks=True,
+                        dirs_exist_ok=True)
 
     def copy_pkg_source_to(self, tmp_build_dir, src_dir, pkg):
         for mod_file in pkg.iter_files():
